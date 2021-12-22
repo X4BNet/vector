@@ -289,6 +289,17 @@ releases: "0.19.0": {
 				"""
 			pr_numbers: [10526]
 		},
+		{
+			type: "feat"
+			scopes: ["sources"]
+			description: """
+				A new `connection_limit` option has been added to TCP-based
+				sources like `socket` and `syslog` to limit the number of
+				allowed TCP connections. This can be useful to limit resource
+				utilization by Vector.
+				"""
+			pr_numbers: [10491]
+		},
 	]
 
 	commits: [
@@ -489,5 +500,6 @@ releases: "0.19.0": {
 		{sha: "85431ff77a919486b942f783490f7f2235ae32be", date: "2021-12-21 23:58:21 UTC", description: "Basic release changelog rendering", pr_number:                                                10527, scopes: [], type:                                              "docs", breaking_change:        false, author: "Jesse Szwedko", files_count:        3, insertions_count:   107, deletions_count:  171},
 		{sha: "ce8572ba2bb5518b4114783ee015f18879d3adcd", date: "2021-12-22 03:07:26 UTC", description: "remove deprecated config", pr_number:                                                         10488, scopes: ["elasticsearch sink"], type:                          "chore", breaking_change:       false, author: "Nathan Fox", files_count:           12, insertions_count:  115, deletions_count:  75},
 		{sha: "1cd6548b2dfd65dbad17ad7cfbfdd335713709cf", date: "2021-12-22 08:49:43 UTC", description: "Update k8s-e2e to use new helm chart", pr_number:                                             10521, scopes: [], type:                                              "chore", breaking_change:       false, author: "Spencer Gilbert", files_count:      8, insertions_count:   264, deletions_count:  400},
+		{sha: "633a27c3c28bbc6cde3eeb34ff7c32651b42f12f", date: "2021-12-23 06:55:19 UTC", description: "add config option to limit source tcp connections", pr_number: 10491, scopes: ["sources"], type: "enhancement", breaking_change: false, author: "Nathan Fox", files_count: 16, insertions_count: 134, deletions_count: 24}
 	]
 }
