@@ -7,8 +7,7 @@ use syslog_loose::{IncompleteDate, Message, ProcId, Protocol};
 use crate::{
     codecs::decoding::{BoxedDeserializer, Deserializer, DeserializerConfig},
     config::log_schema,
-    event::{Event, Value},
-    internal_events::SyslogConvertUtf8Error,
+    event::{Event, Value}
 };
 
 /// Config used to build a `SyslogDeserializer`.
@@ -29,10 +28,7 @@ pub struct SyslogDeserializer;
 
 impl Deserializer for SyslogDeserializer {
     fn parse(&self, bytes: Bytes) -> crate::Result<SmallVec<[Event; 1]>> {
-        let line = std::str::from_utf8(&bytes).map_err(|error| {
-            emit!(&SyslogConvertUtf8Error { error });
-            error
-        })?;
+        let line = String::from_utf8_lossy(&bytes).to_string();
         let line = line.trim();
         let parsed = syslog_loose::parse_message_with_year(line, resolve_year);
         let mut event = Event::from(parsed.msg);
