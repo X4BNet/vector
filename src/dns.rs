@@ -8,7 +8,6 @@ use hyper::client::connect::dns::Name;
 use snafu::ResultExt;
 use tokio::task::spawn_blocking;
 use tower::Service;
-use rand::thread_rng;
 use rand::seq::SliceRandom;
 
 pub struct LookupIp(std::vec::IntoIter<SocketAddr>);
