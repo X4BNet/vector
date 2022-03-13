@@ -8,6 +8,8 @@ use hyper::client::connect::dns::Name;
 use snafu::ResultExt;
 use tokio::task::spawn_blocking;
 use tower::Service;
+use rand::thread_rng;
+use rand::seq::SliceRandom;
 
 pub struct LookupIp(std::vec::IntoIter<SocketAddr>);
 
@@ -52,7 +54,8 @@ impl Iterator for LookupIp {
     type Item = IpAddr;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|address| address.ip())
+        let dns = self.0.as_slice();
+        dns.choose(&mut rand::thread_rng()).map(|address| address.ip())
     }
 }
 
