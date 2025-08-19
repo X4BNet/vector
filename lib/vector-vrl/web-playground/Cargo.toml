@@ -2,6 +2,9 @@
 name = "vector-vrl-web-playground"
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/vectordotdev/vector"
+description = "A playground for experimenting with VRL"
+license = "MPL-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -11,12 +14,13 @@ crate-type = ["cdylib"]
 [dependencies]
 wasm-bindgen = "0.2"
 vrl.workspace = true
-serde = { version = "1.0", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
+serde.workspace = true
+web-sys = { version = "0.3", features = ["Window", "Performance"] }
 gloo-utils = { version = "0.2", features = ["serde"] }
-getrandom = { version = "0.2", features = ["js"] }
 vector-vrl-functions = { path = "../functions" }
 enrichment = { path = "../../enrichment" }
+# Required per https://docs.rs/getrandom/latest/getrandom/#webassembly-support
+getrandom = { version = "0.2.15", features = ["js"] }
 
 [build-dependencies]
-cargo_toml = "0.17.1"
+cargo-lock = "10.1.0"

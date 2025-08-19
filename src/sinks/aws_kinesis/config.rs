@@ -62,7 +62,7 @@ pub struct KinesisSinkBaseConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 
@@ -99,7 +99,7 @@ where
     R: Send + 'static,
     RR: Record + Record<T = R> + Clone + Send + Sync + Unpin + 'static,
     E: Send + 'static,
-    RT: RetryLogic<Response = KinesisResponse> + Default,
+    RT: RetryLogic<Request = BatchKinesisRequest<RR>, Response = KinesisResponse> + Default,
 {
     let request_limits = config.request.into_settings();
 

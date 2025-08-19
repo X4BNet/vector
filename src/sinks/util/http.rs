@@ -1,4 +1,47 @@
+#[cfg(feature = "aws-core")]
+use aws_credential_types::provider::SharedCredentialsProvider;
+#[cfg(feature = "aws-core")]
+use aws_types::region::Region;
+use bytes::{Buf, Bytes};
+use futures::{future::BoxFuture, Sink};
+use headers::HeaderName;
+use http::{header, HeaderValue, Request, Response, StatusCode};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrderedHeaderName(HeaderName);
+
+impl OrderedHeaderName {
+    pub const fn new(header_name: HeaderName) -> Self {
+        Self(header_name)
+    }
+
+    pub const fn inner(&self) -> &HeaderName {
+        &self.0
+    }
+}
+
+impl From<HeaderName> for OrderedHeaderName {
+    fn from(header_name: HeaderName) -> Self {
+        Self(header_name)
+    }
+}
+
+impl Ord for OrderedHeaderName {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_str().cmp(other.0.as_str())
+    }
+}
+
+impl PartialOrd for OrderedHeaderName {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+use hyper::{body, Body};
+use pin_project::pin_project;
+use snafu::{ResultExt, Snafu};
 use std::{
+    collections::BTreeMap,
     fmt,
     future::Future,
     hash::Hash,
@@ -8,20 +51,12 @@ use std::{
     task::{ready, Context, Poll},
     time::Duration,
 };
-
-use bytes::{Buf, Bytes};
-use futures::{future::BoxFuture, Sink};
-use headers::HeaderName;
-use http::{header, HeaderValue, Request, Response, StatusCode};
-use hyper::{body, Body};
-use indexmap::IndexMap;
-use pin_project::pin_project;
-use snafu::{ResultExt, Snafu};
 use tower::{Service, ServiceBuilder};
 use tower_http::decompression::DecompressionLayer;
-use vector_lib::configurable::configurable_component;
-use vector_lib::stream::batcher::limiter::ItemBatchSize;
-use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
+use vector_lib::{
+    configurable::configurable_component, stream::batcher::limiter::ItemBatchSize, ByteSizeOf,
+    EstimatedJsonEncodedSizeOf,
+};
 
 use super::{
     retries::{RetryAction, RetryLogic},
@@ -29,11 +64,16 @@ use super::{
     uri, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestSettings,
 };
+
+#[cfg(feature = "aws-core")]
+use crate::aws::sign_request;
+
 use crate::{
     event::Event,
     http::{HttpClient, HttpError},
     internal_events::{EndpointBytesSent, SinkRequestBuildError},
     sinks::prelude::*,
+    template::Template,
 };
 
 pub trait HttpEventEncoder<Output> {
@@ -41,14 +81,16 @@ pub trait HttpEventEncoder<Output> {
     fn encode_event(&mut self, event: Event) -> Option<Output>;
 }
 
-#[async_trait::async_trait]
 pub trait HttpSink: Send + Sync + 'static {
     type Input;
     type Output;
     type Encoder: HttpEventEncoder<Self::Input>;
 
     fn build_encoder(&self) -> Self::Encoder;
-    async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Bytes>>;
+    fn build_request(
+        &self,
+        events: Self::Output,
+    ) -> impl Future<Output = crate::Result<http::Request<Bytes>>> + Send;
 }
 
 /// Provides a simple wrapper around internal tower and
@@ -67,12 +109,14 @@ pub trait HttpSink: Send + Sync + 'static {
 ///
 /// Note: This has been deprecated, please do not use when creating new Sinks.
 #[pin_project]
-pub struct BatchedHttpSink<T, B, RL = HttpRetryLogic>
+pub struct BatchedHttpSink<T, B, RL = HttpRetryLogic<<B as Batch>::Output>>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
-    RL: RetryLogic<Response = http::Response<Bytes>> + Send + 'static,
+    RL: RetryLogic<Request = <B as Batch>::Output, Response = http::Response<Bytes>>
+        + Send
+        + 'static,
 {
     sink: Arc<T>,
     #[pin]
@@ -91,7 +135,7 @@ where
 impl<T, B> BatchedHttpSink<T, B>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
 {
     pub fn new(
@@ -104,7 +148,7 @@ where
         Self::with_logic(
             sink,
             batch,
-            HttpRetryLogic,
+            HttpRetryLogic::default(),
             request_settings,
             batch_timeout,
             client,
@@ -115,8 +159,10 @@ where
 impl<T, B, RL> BatchedHttpSink<T, B, RL>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
-    RL: RetryLogic<Response = http::Response<Bytes>, Error = HttpError> + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
+    RL: RetryLogic<Request = B::Output, Response = http::Response<Bytes>, Error = HttpError>
+        + Send
+        + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
 {
     pub fn with_logic(
@@ -151,9 +197,11 @@ where
 impl<T, B, RL> Sink<Event> for BatchedHttpSink<T, B, RL>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
-    RL: RetryLogic<Response = http::Response<Bytes>> + Send + 'static,
+    RL: RetryLogic<Request = <B as Batch>::Output, Response = http::Response<Bytes>>
+        + Send
+        + 'static,
 {
     type Error = crate::Error;
 
@@ -207,14 +255,14 @@ where
 
 /// Note: This has been deprecated, please do not use when creating new Sinks.
 #[pin_project]
-pub struct PartitionHttpSink<T, B, K, RL = HttpRetryLogic>
+pub struct PartitionHttpSink<T, B, K, RL = HttpRetryLogic<<B as Batch>::Output>>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     B::Input: Partition<K>,
     K: Hash + Eq + Clone + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
-    RL: RetryLogic<Response = http::Response<Bytes>> + Send + 'static,
+    RL: RetryLogic<Request = B::Output, Response = http::Response<Bytes>> + Send + 'static,
 {
     sink: Arc<T>,
     #[pin]
@@ -228,10 +276,10 @@ where
     slot: Option<EncodedEvent<B::Input>>,
 }
 
-impl<T, B, K> PartitionHttpSink<T, B, K, HttpRetryLogic>
+impl<T, B, K> PartitionHttpSink<T, B, K, HttpRetryLogic<<B as Batch>::Output>>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     B::Input: Partition<K>,
     K: Hash + Eq + Clone + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
@@ -246,7 +294,7 @@ where
         Self::with_retry_logic(
             sink,
             batch,
-            HttpRetryLogic,
+            HttpRetryLogic::default(),
             request_settings,
             batch_timeout,
             client,
@@ -257,11 +305,13 @@ where
 impl<T, B, K, RL> PartitionHttpSink<T, B, K, RL>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     B::Input: Partition<K>,
     K: Hash + Eq + Clone + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
-    RL: RetryLogic<Response = http::Response<Bytes>, Error = HttpError> + Send + 'static,
+    RL: RetryLogic<Request = B::Output, Response = http::Response<Bytes>, Error = HttpError>
+        + Send
+        + 'static,
 {
     pub fn with_retry_logic(
         sink: T,
@@ -301,11 +351,11 @@ where
 impl<T, B, K, RL> Sink<Event> for PartitionHttpSink<T, B, K, RL>
 where
     B: Batch,
-    B::Output: ByteSizeOf + Clone + Send + 'static,
+    B::Output: ByteSizeOf + Clone + Sync + Send + 'static,
     B::Input: Partition<K>,
     K: Hash + Eq + Clone + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
-    RL: RetryLogic<Response = http::Response<Bytes>> + Send + 'static,
+    RL: RetryLogic<Request = B::Output, Response = http::Response<Bytes>> + Send + 'static,
 {
     type Error = crate::Error;
 
@@ -358,6 +408,14 @@ where
     }
 }
 
+#[cfg(feature = "aws-core")]
+#[derive(Clone)]
+pub struct SigV4Config {
+    pub(crate) shared_credentials_provider: SharedCredentialsProvider,
+    pub(crate) region: Region,
+    pub(crate) service: String,
+}
+
 /// @struct HttpBatchService
 ///
 /// NOTE: This has been deprecated, please do not use directly when creating new sinks.
@@ -367,6 +425,8 @@ where
 pub struct HttpBatchService<F, B = Bytes> {
     inner: HttpClient<Body>,
     request_builder: Arc<dyn Fn(B) -> F + Send + Sync>,
+    #[cfg(feature = "aws-core")]
+    sig_v4_config: Option<SigV4Config>,
 }
 
 impl<F, B> HttpBatchService<F, B> {
@@ -377,6 +437,21 @@ impl<F, B> HttpBatchService<F, B> {
         HttpBatchService {
             inner,
             request_builder: Arc::new(Box::new(request_builder)),
+            #[cfg(feature = "aws-core")]
+            sig_v4_config: None,
+        }
+    }
+
+    #[cfg(feature = "aws-core")]
+    pub fn new_with_sig_v4(
+        inner: HttpClient,
+        request_builder: impl Fn(B) -> F + Send + Sync + 'static,
+        sig_v4_config: SigV4Config,
+    ) -> Self {
+        HttpBatchService {
+            inner,
+            request_builder: Arc::new(Box::new(request_builder)),
+            sig_v4_config: Some(sig_v4_config),
         }
     }
 }
@@ -396,13 +471,32 @@ where
 
     fn call(&mut self, body: B) -> Self::Future {
         let request_builder = Arc::clone(&self.request_builder);
+        #[cfg(feature = "aws-core")]
+        let sig_v4_config = self.sig_v4_config.clone();
         let http_client = self.inner.clone();
 
         Box::pin(async move {
-            let request = request_builder(body).await.map_err(|error| {
-                emit!(SinkRequestBuildError { error: &error });
-                error
+            let request = request_builder(body).await.inspect_err(|error| {
+                emit!(SinkRequestBuildError { error });
             })?;
+
+            #[cfg(feature = "aws-core")]
+            let request = match sig_v4_config {
+                None => request,
+                Some(sig_v4_config) => {
+                    let mut signed_request = request;
+                    sign_request(
+                        sig_v4_config.service.as_str(),
+                        &mut signed_request,
+                        &sig_v4_config.shared_credentials_provider,
+                        Some(&sig_v4_config.region),
+                        false,
+                    )
+                    .await?;
+
+                    signed_request
+                }
+            };
             let byte_size = request.body().len();
             let request = request.map(Body::from);
             let (protocol, endpoint) = uri::protocol_endpoint(request.uri().clone());
@@ -439,6 +533,8 @@ impl<F, B> Clone for HttpBatchService<F, B> {
         Self {
             inner: self.inner.clone(),
             request_builder: Arc::clone(&self.request_builder),
+            #[cfg(feature = "aws-core")]
+            sig_v4_config: self.sig_v4_config.clone(),
         }
     }
 }
@@ -453,22 +549,33 @@ impl<T: fmt::Debug> sink::Response for http::Response<T> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct HttpRetryLogic;
+#[derive(Debug, Clone)]
+pub struct HttpRetryLogic<Req> {
+    request: PhantomData<Req>,
+}
+impl<Req> Default for HttpRetryLogic<Req> {
+    fn default() -> Self {
+        Self {
+            request: PhantomData,
+        }
+    }
+}
 
-impl RetryLogic for HttpRetryLogic {
+impl<Req: Clone + Send + Sync + 'static> RetryLogic for HttpRetryLogic<Req> {
     type Error = HttpError;
+    type Request = Req;
     type Response = hyper::Response<Bytes>;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
         true
     }
 
-    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
         let status = response.status();
 
         match status {
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
@@ -476,7 +583,7 @@ impl RetryLogic for HttpRetryLogic {
                 format!("{}: {}", status, String::from_utf8_lossy(response.body())).into(),
             ),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::DontRetry(format!("response status: {status}").into()),
         }
     }
 }
@@ -484,54 +591,60 @@ impl RetryLogic for HttpRetryLogic {
 /// A more generic version of `HttpRetryLogic` that accepts anything that can be converted
 /// to a status code
 #[derive(Debug)]
-pub struct HttpStatusRetryLogic<F, T> {
+pub struct HttpStatusRetryLogic<F, Req, Res> {
     func: F,
-    request: PhantomData<T>,
+    request: PhantomData<Req>,
+    response: PhantomData<Res>,
 }
 
-impl<F, T> HttpStatusRetryLogic<F, T>
+impl<F, Req, Res> HttpStatusRetryLogic<F, Req, Res>
 where
-    F: Fn(&T) -> StatusCode + Clone + Send + Sync + 'static,
-    T: Send + Sync + 'static,
+    F: Fn(&Res) -> StatusCode + Clone + Send + Sync + 'static,
+    Req: Send + Sync + 'static,
+    Res: Send + Sync + 'static,
 {
-    pub const fn new(func: F) -> HttpStatusRetryLogic<F, T> {
+    pub const fn new(func: F) -> HttpStatusRetryLogic<F, Req, Res> {
         HttpStatusRetryLogic {
             func,
             request: PhantomData,
+            response: PhantomData,
         }
     }
 }
 
-impl<F, T> RetryLogic for HttpStatusRetryLogic<F, T>
+impl<F, Req, Res> RetryLogic for HttpStatusRetryLogic<F, Req, Res>
 where
-    F: Fn(&T) -> StatusCode + Clone + Send + Sync + 'static,
-    T: Send + Sync + 'static,
+    F: Fn(&Res) -> StatusCode + Clone + Send + Sync + 'static,
+    Req: Send + Sync + 'static,
+    Res: Send + Sync + 'static,
 {
     type Error = HttpError;
-    type Response = T;
+    type Request = Req;
+    type Response = Res;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
         true
     }
 
-    fn should_retry_response(&self, response: &T) -> RetryAction {
+    fn should_retry_response(&self, response: &Res) -> RetryAction<Req> {
         let status = (self.func)(response);
 
         match status {
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
             _ if status.is_server_error() => {
-                RetryAction::Retry(format!("Http Status: {}", status).into())
+                RetryAction::Retry(format!("Http Status: {status}").into())
             }
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("Http status: {}", status).into()),
+            _ => RetryAction::DontRetry(format!("Http status: {status}").into()),
         }
     }
 }
 
-impl<F, T> Clone for HttpStatusRetryLogic<F, T>
+impl<F, Req, Res> Clone for HttpStatusRetryLogic<F, Req, Res>
 where
     F: Clone,
 {
@@ -539,6 +652,7 @@ where
         Self {
             func: self.func.clone(),
             request: PhantomData,
+            response: PhantomData,
         }
     }
 }
@@ -553,25 +667,48 @@ pub struct RequestConfig {
     /// Additional HTTP headers to add to every HTTP request.
     #[serde(default)]
     #[configurable(metadata(
-        docs::additional_props_description = "An HTTP request header and it's value."
+        docs::additional_props_description = "An HTTP request header and its value. Both header names and values support templating with event data."
     ))]
     #[configurable(metadata(docs::examples = "headers_examples()"))]
-    pub headers: IndexMap<String, String>,
+    pub headers: BTreeMap<String, String>,
 }
 
-fn headers_examples() -> IndexMap<String, String> {
-    IndexMap::<_, _>::from_iter([
-        ("Accept".to_owned(), "text/plain".to_owned()),
-        ("X-My-Custom-Header".to_owned(), "A-Value".to_owned()),
-    ])
+fn headers_examples() -> BTreeMap<String, String> {
+    btreemap! {
+        "Accept" => "text/plain",
+        "X-My-Custom-Header" => "A-Value",
+        "X-Event-Level" => "{{level}}",
+        "X-Event-Timestamp" => "{{timestamp}}",
+    }
 }
 
 impl RequestConfig {
-    pub fn add_old_option(&mut self, headers: Option<IndexMap<String, String>>) {
+    pub fn add_old_option(&mut self, headers: Option<BTreeMap<String, String>>) {
         if let Some(headers) = headers {
             warn!("Option `headers` has been deprecated. Use `request.headers` instead.");
             self.headers.extend(headers);
         }
+    }
+
+    pub fn split_headers(&self) -> (BTreeMap<String, String>, BTreeMap<String, Template>) {
+        let mut static_headers = BTreeMap::new();
+        let mut template_headers = BTreeMap::new();
+
+        for (name, value) in &self.headers {
+            match Template::try_from(value.as_str()) {
+                Ok(template) if !template.is_dynamic() => {
+                    static_headers.insert(name.clone(), value.clone());
+                }
+                Ok(template) => {
+                    template_headers.insert(name.clone(), template);
+                }
+                Err(_) => {
+                    static_headers.insert(name.clone(), value.clone());
+                }
+            }
+        }
+
+        (static_headers, template_headers)
     }
 }
 
@@ -590,51 +727,62 @@ pub enum HeaderValidationError {
 }
 
 pub fn validate_headers(
-    headers: &IndexMap<String, String>,
-) -> crate::Result<IndexMap<HeaderName, HeaderValue>> {
-    let mut validated_headers = IndexMap::new();
+    headers: &BTreeMap<String, String>,
+) -> crate::Result<BTreeMap<OrderedHeaderName, HeaderValue>> {
+    let mut validated_headers = BTreeMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes())
             .with_context(|_| InvalidHeaderNameSnafu { name })?;
         let value = HeaderValue::from_bytes(value.as_bytes())
             .with_context(|_| InvalidHeaderValueSnafu { value })?;
 
-        validated_headers.insert(name, value);
+        validated_headers.insert(name.into(), value);
     }
 
     Ok(validated_headers)
 }
 
 /// Request type for use in the `Service` implementation of HTTP stream sinks.
-#[derive(Clone)]
-pub struct HttpRequest {
+#[derive(Debug, Clone)]
+pub struct HttpRequest<T: Send> {
     payload: Bytes,
     finalizers: EventFinalizers,
     request_metadata: RequestMetadata,
+    additional_metadata: T,
 }
 
-impl HttpRequest {
+impl<T: Send> HttpRequest<T> {
     /// Creates a new `HttpRequest`.
-    pub fn new(
+    pub const fn new(
         payload: Bytes,
         finalizers: EventFinalizers,
         request_metadata: RequestMetadata,
+        additional_metadata: T,
     ) -> Self {
         Self {
             payload,
             finalizers,
             request_metadata,
+            additional_metadata,
         }
+    }
+
+    pub const fn get_additional_metadata(&self) -> &T {
+        &self.additional_metadata
+    }
+
+    pub fn take_payload(&mut self) -> Bytes {
+        std::mem::take(&mut self.payload)
     }
 }
 
-impl Finalizable for HttpRequest {
+impl<T: Send> Finalizable for HttpRequest<T> {
     fn take_finalizers(&mut self) -> EventFinalizers {
         self.finalizers.take_finalizers()
     }
 }
 
-impl MetaDescriptive for HttpRequest {
+impl<T: Send> MetaDescriptive for HttpRequest<T> {
     fn get_metadata(&self) -> &RequestMetadata {
         &self.request_metadata
     }
@@ -644,7 +792,7 @@ impl MetaDescriptive for HttpRequest {
     }
 }
 
-impl ByteSizeOf for HttpRequest {
+impl<T: Send> ByteSizeOf for HttpRequest<T> {
     fn allocated_bytes(&self) -> usize {
         self.payload.allocated_bytes() + self.finalizers.allocated_bytes()
     }
@@ -678,8 +826,9 @@ impl DriverResponse for HttpResponse {
 }
 
 /// Creates a `RetryLogic` for use with `HttpResponse`.
-pub fn http_response_retry_logic() -> HttpStatusRetryLogic<
+pub fn http_response_retry_logic<Request: Clone + Send + Sync + 'static>() -> HttpStatusRetryLogic<
     impl Fn(&HttpResponse) -> StatusCode + Clone + Send + Sync + 'static,
+    Request,
     HttpResponse,
 > {
     HttpStatusRetryLogic::new(|req: &HttpResponse| req.http_response.status())
@@ -696,30 +845,30 @@ impl ItemBatchSize<Event> for HttpJsonBatchSizer {
 }
 
 /// HTTP request builder for HTTP stream sinks using the generic `HttpService`
-pub trait HttpServiceRequestBuilder {
-    fn build(&self, body: Bytes) -> Request<Bytes>;
+pub trait HttpServiceRequestBuilder<T: Send> {
+    fn build(&self, request: HttpRequest<T>) -> Result<Request<Bytes>, crate::Error>;
 }
 
 /// Generic 'Service' implementation for HTTP stream sinks.
 #[derive(Clone)]
-pub struct HttpService<B> {
+pub struct HttpService<B, T: Send> {
     batch_service:
-        HttpBatchService<BoxFuture<'static, Result<Request<Bytes>, crate::Error>>, HttpRequest>,
+        HttpBatchService<BoxFuture<'static, Result<Request<Bytes>, crate::Error>>, HttpRequest<T>>,
     _phantom: PhantomData<B>,
 }
 
-impl<B> HttpService<B>
+impl<B, T: Send + 'static> HttpService<B, T>
 where
-    B: HttpServiceRequestBuilder + std::marker::Sync + std::marker::Send + 'static,
+    B: HttpServiceRequestBuilder<T> + std::marker::Sync + std::marker::Send + 'static,
 {
     pub fn new(http_client: HttpClient<Body>, http_request_builder: B) -> Self {
         let http_request_builder = Arc::new(http_request_builder);
 
-        let batch_service = HttpBatchService::new(http_client, move |req: HttpRequest| {
+        let batch_service = HttpBatchService::new(http_client, move |req: HttpRequest<T>| {
             let request_builder = Arc::clone(&http_request_builder);
 
             let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
-                Box::pin(async move { Ok(request_builder.build(req.payload)) });
+                Box::pin(async move { request_builder.build(req) });
 
             fut
         });
@@ -728,11 +877,37 @@ where
             _phantom: PhantomData,
         }
     }
+
+    #[cfg(feature = "aws-core")]
+    pub fn new_with_sig_v4(
+        http_client: HttpClient<Body>,
+        http_request_builder: B,
+        sig_v4_config: SigV4Config,
+    ) -> Self {
+        let http_request_builder = Arc::new(http_request_builder);
+
+        let batch_service = HttpBatchService::new_with_sig_v4(
+            http_client,
+            move |req: HttpRequest<T>| {
+                let request_builder = Arc::clone(&http_request_builder);
+
+                let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                    Box::pin(async move { request_builder.build(req) });
+
+                fut
+            },
+            sig_v4_config,
+        );
+        Self {
+            batch_service,
+            _phantom: PhantomData,
+        }
+    }
 }
 
-impl<B> Service<HttpRequest> for HttpService<B>
+impl<B, T: Send + 'static> Service<HttpRequest<T>> for HttpService<B, T>
 where
-    B: HttpServiceRequestBuilder + std::marker::Sync + std::marker::Send + 'static,
+    B: HttpServiceRequestBuilder<T> + std::marker::Sync + std::marker::Send + 'static,
 {
     type Response = HttpResponse;
     type Error = crate::Error;
@@ -742,7 +917,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, mut request: HttpRequest) -> Self::Future {
+    fn call(&mut self, mut request: HttpRequest<T>) -> Self::Future {
         let mut http_service = self.batch_service.clone();
 
         // NOTE: By taking the metadata here, when passing the request to `call()` below,
@@ -778,15 +953,16 @@ mod test {
 
     #[test]
     fn util_http_retry_logic() {
-        let logic = HttpRetryLogic;
+        let logic = HttpRetryLogic::<()>::default();
 
+        let response_408 = Response::builder().status(408).body(Bytes::new()).unwrap();
         let response_429 = Response::builder().status(429).body(Bytes::new()).unwrap();
         let response_500 = Response::builder().status(500).body(Bytes::new()).unwrap();
         let response_400 = Response::builder().status(400).body(Bytes::new()).unwrap();
         let response_501 = Response::builder().status(501).body(Bytes::new()).unwrap();
-
         assert!(logic.should_retry_response(&response_429).is_retryable());
         assert!(logic.should_retry_response(&response_500).is_retryable());
+        assert!(logic.should_retry_response(&response_408).is_retryable());
         assert!(logic
             .should_retry_response(&response_400)
             .is_not_retryable());
@@ -823,7 +999,7 @@ mod test {
                 async move {
                     let mut body = hyper::body::aggregate(req.into_body())
                         .await
-                        .map_err(|error| format!("error: {}", error))?;
+                        .map_err(|error| format!("error: {error}"))?;
                     let string = String::from_utf8(body.copy_to_bytes(body.remaining()).to_vec())
                         .map_err(|_| "Wasn't UTF-8".to_string())?;
                     tx.try_send(string).map_err(|_| "Send error".to_string())?;
@@ -837,14 +1013,14 @@ mod test {
 
         tokio::spawn(async move {
             if let Err(error) = Server::bind(&addr).serve(new_service).await {
-                eprintln!("Server error: {}", error);
+                eprintln!("Server error: {error}");
             }
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         service.call(request).await.unwrap();
 
-        let (body, _rest) = rx.into_future().await;
+        let (body, _rest) = StreamExt::into_future(rx).await;
         assert_eq!(body.unwrap(), "hello");
     }
 }

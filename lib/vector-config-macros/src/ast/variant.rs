@@ -4,7 +4,7 @@ use quote::ToTokens;
 use serde_derive_internals::ast as serde_ast;
 
 use super::{
-    util::{try_extract_doc_title_description, DarlingResultIterator},
+    util::{has_flag_attribute, try_extract_doc_title_description, DarlingResultIterator},
     Field, LazyCustomAttribute, Metadata, Style, Tagging,
 };
 
@@ -39,6 +39,15 @@ impl<'a> Variant<'a> {
             .iter()
             .map(|field| Field::from_ast(field, is_virtual_newtype, is_newtype_wrapper_field))
             .collect_darling_results(&mut accumulator);
+
+        // If the enum overall is tagged (internal/adjacent) serde still allows one or more
+        // variants to be explicitly marked with `#[serde(untagged)]`. In that case, the
+        // variant itself is untagged; reflect that here so schema generation matches serde.
+        let tagging = if has_flag_attribute(&original.attrs, "serde", "untagged") {
+            Tagging::None
+        } else {
+            tagging
+        };
 
         let variant = Variant {
             original,
@@ -166,7 +175,7 @@ impl<'a> Variant<'a> {
     }
 }
 
-impl<'a> ToTokens for Variant<'a> {
+impl ToTokens for Variant<'_> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         self.original.to_tokens(tokens)
     }
@@ -204,7 +213,7 @@ impl Attributes {
     }
 }
 
-impl<'a> PartialEq for Variant<'a> {
+impl PartialEq for Variant<'_> {
     fn eq(&self, other: &Self) -> bool {
         // Equality checking between variants is only used to drive conformance checks around making
         // sure no duplicate variants exist when in untagged mode, so all we care about is what

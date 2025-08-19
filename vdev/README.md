@@ -13,6 +13,12 @@ Table of Contents:
 - [CLI](#cli)
 - [Running Tests](#running-tests)
 
+## Pre-requisites
+
+This assumes that you have the following tools installed:
+
+- cargo-nextest - https://nexte.st/
+
 ## Installation
 
 Run the following command from the root of the Vector repository:
@@ -72,4 +78,4 @@ Every command group/namespace has its own directory with a `cli` module, includi
 
 Unit tests can be run by calling `cargo vdev test`.
 
-Integration tests are not run by default when running`cargo vdev test`. Instead, they are accessible via the integration subcommand (example: `cargo vdev int test aws` runs aws-related integration tests). You can find the list of available integration tests using `cargo vdev int show`. Integration tests require docker or podman to run.
+Integration tests are not run by default when running `cargo vdev test`. Instead, they are accessible via the integration subcommand (example: `cargo vdev int test aws` runs aws-related integration tests). You can find the list of available integration tests using `cargo vdev int show`. Integration tests require docker or podman to run.

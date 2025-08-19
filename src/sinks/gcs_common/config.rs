@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 use futures::FutureExt;
 use http::{StatusCode, Uri};
 use hyper::Body;
@@ -14,7 +16,9 @@ use crate::{
     },
 };
 
-pub const BASE_URL: &str = "https://storage.googleapis.com/";
+pub fn default_endpoint() -> String {
+    "https://storage.googleapis.com".to_string()
+}
 
 /// GCS Predefined ACLs.
 ///
@@ -136,30 +140,49 @@ pub fn healthcheck_response(
     }
 }
 
-#[derive(Clone)]
-pub struct GcsRetryLogic;
+pub struct GcsRetryLogic<Request> {
+    request: PhantomData<Request>,
+}
+
+impl<Request> Default for GcsRetryLogic<Request> {
+    fn default() -> Self {
+        Self {
+            request: PhantomData,
+        }
+    }
+}
+
+impl<Request> Clone for GcsRetryLogic<Request> {
+    fn clone(&self) -> Self {
+        Self {
+            request: PhantomData,
+        }
+    }
+}
 
 // This is a clone of HttpRetryLogic for the Body type, should get merged
-impl RetryLogic for GcsRetryLogic {
+impl<Request: Clone + Send + Sync + 'static> RetryLogic for GcsRetryLogic<Request> {
     type Error = hyper::Error;
+    type Request = Request;
     type Response = GcsResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
         true
     }
 
-    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
         let status = response.inner.status();
 
         match status {
             StatusCode::UNAUTHORIZED => RetryAction::Retry("unauthorized".into()),
+            StatusCode::REQUEST_TIMEOUT => RetryAction::Retry("request timeout".into()),
             StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("too many requests".into()),
             StatusCode::NOT_IMPLEMENTED => {
                 RetryAction::DontRetry("endpoint not implemented".into())
             }
             _ if status.is_server_error() => RetryAction::Retry(status.to_string().into()),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::DontRetry(format!("response status: {status}").into()),
         }
     }
 }

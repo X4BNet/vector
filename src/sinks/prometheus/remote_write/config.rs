@@ -63,14 +63,14 @@ pub struct RemoteWriteConfig {
 
     /// Default buckets to use for aggregating [distribution][dist_metric_docs] metrics into histograms.
     ///
-    /// [dist_metric_docs]: https://vector.dev/docs/about/under-the-hood/architecture/data-model/metric/#distribution
+    /// [dist_metric_docs]: https://vector.dev/docs/architecture/data-model/metric/#distribution
     #[serde(default = "crate::sinks::prometheus::default_histogram_buckets")]
     #[configurable(metadata(docs::advanced))]
     pub buckets: Vec<f64>,
 
     /// Quantiles to use for aggregating [distribution][dist_metric_docs] metrics into a summary.
     ///
-    /// [dist_metric_docs]: https://vector.dev/docs/about/under-the-hood/architecture/data-model/metric/#distribution
+    /// [dist_metric_docs]: https://vector.dev/docs/architecture/data-model/metric/#distribution
     #[serde(default = "crate::sinks::prometheus::default_summary_quantiles")]
     #[configurable(metadata(docs::advanced))]
     pub quantiles: Vec<f64>,
@@ -93,6 +93,14 @@ pub struct RemoteWriteConfig {
     #[configurable(metadata(docs::advanced))]
     pub tenant_id: Option<Template>,
 
+    /// The amount of time, in seconds, that incremental metrics will persist in the internal metrics cache
+    /// after having not been updated before they expire and are removed.
+    ///
+    /// If unset, sending unique incremental metrics to this sink will cause indefinite memory growth.
+    #[serde(skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::common = false, docs::required = false))]
+    pub expire_metrics_secs: Option<f64>,
+
     #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
@@ -108,7 +116,7 @@ pub struct RemoteWriteConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 
@@ -134,7 +142,7 @@ impl SinkConfig for RemoteWriteConfig {
 
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         let endpoint = self.endpoint.parse::<Uri>().context(UriParseSnafu)?;
-        let tls_settings = TlsSettings::from_options(&self.tls)?;
+        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let request_settings = self.request.into_settings();
         let buckets = self.buckets.clone();
         let quantiles = self.quantiles.clone();
@@ -163,7 +171,9 @@ impl SinkConfig for RemoteWriteConfig {
                     .ok_or(Errors::AwsRegionRequired)?
                     .ok_or(Errors::AwsRegionRequired)?;
                 Some(Auth::Aws {
-                    credentials_provider: aws_auth.credentials_provider(region.clone()).await?,
+                    credentials_provider: aws_auth
+                        .credentials_provider(region.clone(), cx.proxy(), self.tls.as_ref())
+                        .await?,
                     region,
                 })
             }
@@ -200,6 +210,7 @@ impl SinkConfig for RemoteWriteConfig {
             buckets,
             quantiles,
             default_namespace,
+            expire_metrics_secs: self.expire_metrics_secs,
             service,
         };
 

@@ -5,8 +5,8 @@ use snafu::ResultExt;
 use crate::sinks::prelude::*;
 
 use super::{
-    config::{NatsSinkConfig, NatsTowerRequestConfigDefaults},
-    request_builder::{NatsEncoder, NatsRequestBuilder},
+    config::{NatsHeaderConfig, NatsPublisher, NatsSinkConfig, NatsTowerRequestConfigDefaults},
+    request_builder::{NatsEncoder, NatsRequest, NatsRequestBuilder},
     service::{NatsResponse, NatsService},
     EncodingSnafu, NatsError,
 };
@@ -20,8 +20,9 @@ pub(super) struct NatsSink {
     request: TowerRequestConfig<NatsTowerRequestConfigDefaults>,
     transformer: Transformer,
     encoder: Encoder<()>,
-    connection: Arc<async_nats::Client>,
+    publisher: Arc<NatsPublisher>,
     subject: Template,
+    headers: Option<NatsHeaderConfig>,
 }
 
 impl NatsSink {
@@ -42,19 +43,21 @@ impl NatsSink {
     }
 
     pub(super) async fn new(config: NatsSinkConfig) -> Result<Self, NatsError> {
-        let connection = Arc::new(config.connect().await?);
+        let publisher = Arc::new(config.publisher().await?);
         let transformer = config.encoding.transformer();
         let serializer = config.encoding.build().context(EncodingSnafu)?;
         let encoder = Encoder::<()>::new(serializer);
         let request = config.request;
         let subject = config.subject;
+        let headers = config.jetstream.headers;
 
         Ok(NatsSink {
             request,
-            connection,
             transformer,
             encoder,
+            publisher,
             subject,
+            headers,
         })
     }
 
@@ -66,12 +69,13 @@ impl NatsSink {
                 encoder: self.encoder.clone(),
                 transformer: self.transformer.clone(),
             },
+            headers: self.headers.clone(),
         };
 
         let service = ServiceBuilder::new()
             .settings(request, NatsRetryLogic)
             .service(NatsService {
-                connection: Arc::clone(&self.connection),
+                publisher: Arc::clone(&self.publisher),
             });
 
         input
@@ -105,6 +109,7 @@ pub(super) struct NatsRetryLogic;
 
 impl RetryLogic for NatsRetryLogic {
     type Error = NatsError;
+    type Request = NatsRequest;
     type Response = NatsResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {

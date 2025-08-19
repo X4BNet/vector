@@ -42,8 +42,7 @@ impl CompressionScheme {
             .map(|s| {
                 s.to_str().map(|s| s.to_string()).map_err(|_| {
                     Status::unimplemented(format!(
-                        "`{}` contains non-visible characters and is not a valid encoding",
-                        GRPC_ENCODING_HEADER
+                        "`{GRPC_ENCODING_HEADER}` contains non-visible characters and is not a valid encoding"
                     ))
                 })
             })
@@ -53,8 +52,7 @@ impl CompressionScheme {
                 Some(scheme) => match scheme.as_str() {
                     "gzip" => Ok(Some(CompressionScheme::Gzip)),
                     other => Err(Status::unimplemented(format!(
-                        "compression scheme `{}` is not supported",
-                        other
+                        "compression scheme `{other}` is not supported"
                     ))),
                 },
             })
@@ -83,8 +81,7 @@ impl Default for State {
 fn new_decompressor() -> GzDecoder<Vec<u8>> {
     // Create the backing buffer for the decompressor and set the compression flag to false (0) and pre-allocate
     // the space for the length prefix, which we'll fill out once we've finalized the decompressor.
-    let mut buf = Vec::new();
-    buf.resize(GRPC_MESSAGE_HEADER_LEN, 0x00);
+    let buf = vec![0; GRPC_MESSAGE_HEADER_LEN];
 
     GzDecoder::new(buf)
 }

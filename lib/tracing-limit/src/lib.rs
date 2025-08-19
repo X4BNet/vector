@@ -20,7 +20,7 @@ extern crate tracing;
 use std::time::Instant;
 
 #[cfg(test)]
-use mock_instant::Instant;
+use mock_instant::global::Instant;
 
 const RATE_LIMIT_FIELD: &str = "internal_log_rate_limit";
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
@@ -389,7 +389,7 @@ impl Visit for RateLimitedSpanKeys {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.record(field, format!("{:?}", value).into());
+        self.record(field, format!("{value:?}").into());
     }
 }
 
@@ -437,7 +437,7 @@ impl Visit for MessageVisitor {
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if self.message.is_none() && field.name() == MESSAGE_FIELD {
-            self.message = Some(format!("{:?}", value));
+            self.message = Some(format!("{value:?}"));
         }
     }
 }
@@ -449,7 +449,7 @@ mod test {
         time::Duration,
     };
 
-    use mock_instant::MockClock;
+    use mock_instant::global::MockClock;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
@@ -577,8 +577,7 @@ mod test {
                             info_span!("span", component_id = &key, vrl_position = &line_number);
                         let _enter = span.enter();
                         info!(
-                            message =
-                                format!("Hello {} on line_number {}!", key, line_number).as_str(),
+                            message = format!("Hello {key} on line_number {line_number}!").as_str(),
                             internal_log_rate_limit = true
                         );
                     }
@@ -639,8 +638,7 @@ mod test {
                 for key in &["foo", "bar"] {
                     for line_number in &[1, 2] {
                         info!(
-                            message =
-                                format!("Hello {} on line_number {}!", key, line_number).as_str(),
+                            message = format!("Hello {key} on line_number {line_number}!").as_str(),
                             internal_log_rate_limit = true,
                             component_id = &key,
                             vrl_position = &line_number

@@ -1,7 +1,7 @@
 use aws_sdk_cloudwatchlogs::Client as CloudwatchLogsClient;
-use aws_smithy_types::retry::RetryConfig;
 use futures::FutureExt;
 use serde::{de, Deserialize, Deserializer};
+use std::collections::HashMap;
 use tower::ServiceBuilder;
 use vector_lib::codecs::JsonSerializerConfig;
 use vector_lib::configurable::configurable_component;
@@ -9,10 +9,7 @@ use vector_lib::schema;
 use vrl::value::Kind;
 
 use crate::{
-    aws::{
-        create_client, create_smithy_client, resolve_region, AwsAuthentication, ClientBuilder,
-        RegionOrEndpoint,
-    },
+    aws::{create_client, AwsAuthentication, ClientBuilder, RegionOrEndpoint},
     codecs::{Encoder, EncodingConfig},
     config::{
         AcknowledgementsConfig, DataType, GenerateConfig, Input, ProxyConfig, SinkConfig,
@@ -35,16 +32,10 @@ use crate::{
 pub struct CloudwatchLogsClientBuilder;
 
 impl ClientBuilder for CloudwatchLogsClientBuilder {
-    type Config = aws_sdk_cloudwatchlogs::config::Config;
     type Client = aws_sdk_cloudwatchlogs::client::Client;
-    type DefaultMiddleware = aws_sdk_cloudwatchlogs::middleware::DefaultMiddleware;
 
-    fn default_middleware() -> Self::DefaultMiddleware {
-        aws_sdk_cloudwatchlogs::middleware::DefaultMiddleware::new()
-    }
-
-    fn build(client: aws_smithy_client::Client, config: &aws_types::SdkConfig) -> Self::Client {
-        aws_sdk_cloudwatchlogs::client::Client::with_config(client, config.into())
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
+        aws_sdk_cloudwatchlogs::client::Client::new(config)
     }
 }
 
@@ -60,7 +51,7 @@ pub struct Retention {
     #[serde(
         default,
         deserialize_with = "retention_days",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub days: u32,
 }
@@ -77,7 +68,7 @@ where
     if ALLOWED_VALUES.contains(&days) {
         Ok(days)
     } else {
-        let msg = format!("one of allowed values: {:?}", ALLOWED_VALUES).to_owned();
+        let msg = format!("one of allowed values: {ALLOWED_VALUES:?}").to_owned();
         let expected: &str = &msg[..];
         Err(de::Error::invalid_value(
             de::Unexpected::Signed(days.into()),
@@ -171,35 +162,39 @@ pub struct CloudwatchLogsSinkConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
+
+    /// The [ARN][arn] (Amazon Resource Name) of the [KMS key][kms_key] to use when encrypting log data.
+    ///
+    /// [arn]: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference-arns.html
+    /// [kms_key]: https://docs.aws.amazon.com/kms/latest/developerguide/overview.html
+    #[configurable(derived)]
+    #[serde(default)]
+    pub kms_key: Option<String>,
+
+    /// The Key-value pairs to be applied as [tags][tags] to the log group and stream.
+    ///
+    /// [tags]: https://docs.aws.amazon.com/whitepapers/latest/tagging-best-practices/what-are-tags.html
+    #[configurable(derived)]
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "A tag represented as a key-value pair"
+    ))]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 impl CloudwatchLogsSinkConfig {
     pub async fn create_client(&self, proxy: &ProxyConfig) -> crate::Result<CloudwatchLogsClient> {
         create_client::<CloudwatchLogsClientBuilder>(
+            &CloudwatchLogsClientBuilder {},
             &self.auth,
             self.region.region(),
             self.region.endpoint(),
             proxy,
-            &self.tls,
-            true,
-        )
-        .await
-    }
-
-    pub async fn create_smithy_client(
-        &self,
-        proxy: &ProxyConfig,
-    ) -> crate::Result<aws_smithy_client::Client> {
-        let region = resolve_region(self.region.region()).await?;
-        create_smithy_client::<CloudwatchLogsClientBuilder>(
-            region,
-            proxy,
-            &self.tls,
-            true,
-            RetryConfig::disabled(),
+            self.tls.as_ref(),
+            None,
         )
         .await
     }
@@ -212,14 +207,12 @@ impl SinkConfig for CloudwatchLogsSinkConfig {
         let batcher_settings = self.batch.into_batcher_settings()?;
         let request_settings = self.request.tower.into_settings();
         let client = self.create_client(cx.proxy()).await?;
-        let smithy_client = self.create_smithy_client(cx.proxy()).await?;
         let svc = ServiceBuilder::new()
             .settings(request_settings, CloudwatchRetryLogic::new())
             .service(CloudwatchLogsPartitionSvc::new(
                 self.clone(),
                 client.clone(),
-                std::sync::Arc::new(smithy_client),
-            ));
+            )?);
         let transformer = self.encoding.transformer();
         let serializer = self.encoding.build()?;
         let encoder = Encoder::<()>::new(serializer);
@@ -274,6 +267,8 @@ fn default_config(encoding: EncodingConfig) -> CloudwatchLogsSinkConfig {
         assume_role: Default::default(),
         auth: Default::default(),
         acknowledgements: Default::default(),
+        kms_key: Default::default(),
+        tags: Default::default(),
     }
 }
 

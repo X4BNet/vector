@@ -17,10 +17,7 @@ use super::{default_lossy, Deserializer};
 #[derive(Debug, Clone, Default)]
 pub struct JsonDeserializerConfig {
     /// JSON-specific decoding options.
-    #[serde(
-        default,
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
-    )]
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub json: JsonDeserializerOptions,
 }
 
@@ -70,14 +67,14 @@ impl JsonDeserializerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct JsonDeserializerOptions {
-    /// Determines whether or not to replace invalid UTF-8 sequences instead of failing.
+    /// Determines whether to replace invalid UTF-8 sequences instead of failing.
     ///
     /// When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
     ///
     /// [U+FFFD]: https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character
     #[serde(
         default = "default_lossy",
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
+        skip_serializing_if = "vector_core::serde::is_default"
     )]
     #[derivative(Default(value = "default_lossy()"))]
     pub lossy: bool,
@@ -114,7 +111,7 @@ impl Deserializer for JsonDeserializer {
             true => serde_json::from_str(&String::from_utf8_lossy(&bytes)),
             false => serde_json::from_slice(&bytes),
         }
-        .map_err(|error| format!("Error parsing JSON: {:?}", error))?;
+        .map_err(|error| format!("Error parsing JSON: {error:?}"))?;
 
         // If the root is an Array, split it into multiple events
         let mut events = match json {

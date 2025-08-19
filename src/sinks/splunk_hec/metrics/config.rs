@@ -145,7 +145,7 @@ impl GenerateConfig for HecMetricsSinkConfig {
 #[typetag::serde(name = "splunk_hec_metrics")]
 impl SinkConfig for HecMetricsSinkConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
-        let client = create_client(&self.tls, cx.proxy())?;
+        let client = create_client(self.tls.as_ref(), cx.proxy())?;
         let healthcheck = build_healthcheck(
             self.endpoint.clone(),
             self.default_token.inner().to_owned(),
@@ -166,11 +166,7 @@ impl SinkConfig for HecMetricsSinkConfig {
 }
 
 impl HecMetricsSinkConfig {
-    pub fn build_processor(
-        &self,
-        client: HttpClient,
-        cx: SinkContext,
-    ) -> crate::Result<VectorSink> {
+    pub fn build_processor(&self, client: HttpClient, _: SinkContext) -> crate::Result<VectorSink> {
         let ack_client = if self.acknowledgements.indexer_acknowledgements_enabled {
             Some(client.clone())
         } else {
@@ -189,7 +185,7 @@ impl HecMetricsSinkConfig {
             self.compression,
         ));
         let http_service = ServiceBuilder::new()
-            .settings(request_settings, HttpRetryLogic)
+            .settings(request_settings, HttpRetryLogic::default())
             .service(build_http_batch_service(
                 client,
                 Arc::clone(&http_request_builder),
@@ -207,7 +203,6 @@ impl HecMetricsSinkConfig {
         let batch_settings = self.batch.into_batcher_settings()?;
 
         let sink = HecMetricsSink {
-            context: cx,
             service,
             batch_settings,
             request_builder,

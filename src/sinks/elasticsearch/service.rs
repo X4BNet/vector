@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -20,10 +19,13 @@ use super::{ElasticsearchCommon, ElasticsearchConfig};
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
     http::HttpClient,
-    sinks::util::{
-        auth::Auth,
-        http::{HttpBatchService, RequestConfig},
-        Compression, ElementCount,
+    sinks::{
+        elasticsearch::{encoder::ProcessedEvent, request_builder::ElasticsearchRequestBuilder},
+        util::{
+            auth::Auth,
+            http::{HttpBatchService, RequestConfig},
+            Compression, ElementCount,
+        },
     },
 };
 
@@ -34,6 +36,8 @@ pub struct ElasticsearchRequest {
     pub batch_size: usize,
     pub events_byte_size: JsonSize,
     pub metadata: RequestMetadata,
+    pub original_events: Vec<ProcessedEvent>, //store original_events for reconstruct request when retrying
+    pub elasticsearch_request_builder: ElasticsearchRequestBuilder,
 }
 
 impl ByteSizeOf for ElasticsearchRequest {
@@ -93,8 +97,8 @@ impl ElasticsearchService {
 
 pub struct HttpRequestBuilder {
     pub bulk_uri: Uri,
-    pub query_params: HashMap<String, String>,
     pub auth: Option<Auth>,
+    pub service_type: crate::sinks::elasticsearch::OpenSearchServiceType,
     pub compression: Compression,
     pub http_request_config: RequestConfig,
 }
@@ -103,10 +107,10 @@ impl HttpRequestBuilder {
     pub fn new(common: &ElasticsearchCommon, config: &ElasticsearchConfig) -> HttpRequestBuilder {
         HttpRequestBuilder {
             bulk_uri: common.bulk_uri.clone(),
-            http_request_config: config.request.clone(),
             auth: common.auth.clone(),
-            query_params: common.query_params.clone(),
+            service_type: common.service_type.clone(),
             compression: config.compression,
+            http_request_config: config.request.clone(),
         }
     }
 
@@ -145,9 +149,10 @@ impl HttpRequestBuilder {
                     region,
                 } => {
                     crate::sinks::elasticsearch::sign_request(
+                        &self.service_type,
                         &mut request,
                         provider,
-                        &Some(region.clone()),
+                        Some(region),
                     )
                     .await?;
                 }
@@ -161,7 +166,6 @@ impl HttpRequestBuilder {
 pub struct ElasticsearchResponse {
     pub http_response: Response<Bytes>,
     pub event_status: EventStatus,
-    pub batch_size: usize,
     pub events_byte_size: GroupedCountByteSize,
 }
 
@@ -190,7 +194,6 @@ impl Service<ElasticsearchRequest> for ElasticsearchService {
         let mut http_service = self.batch_service.clone();
         Box::pin(async move {
             http_service.ready().await?;
-            let batch_size = req.batch_size;
             let events_byte_size =
                 std::mem::take(req.metadata_mut()).into_events_estimated_json_encoded_byte_size();
             let http_response = http_service.call(req).await?;
@@ -199,11 +202,23 @@ impl Service<ElasticsearchRequest> for ElasticsearchService {
             Ok(ElasticsearchResponse {
                 event_status,
                 http_response,
-                batch_size,
                 events_byte_size,
             })
         })
     }
+}
+
+// This event is not part of the event framework but is kept because some users were depending on it
+// to identify the number of errors returned by Elasticsearch. It can be dropped when we have better
+// telemetry. Ref: #15886
+fn emit_bad_response_error(response: &Response<Bytes>) {
+    let error_code = format!("http_response_{}", response.status().as_u16());
+
+    error!(
+        message =  "Response contained errors.",
+        error_code = error_code,
+        response = ?response,
+    );
 }
 
 fn get_event_status(response: &Response<Bytes>) -> EventStatus {
@@ -211,13 +226,16 @@ fn get_event_status(response: &Response<Bytes>) -> EventStatus {
     if status.is_success() {
         let body = String::from_utf8_lossy(response.body());
         if body.contains("\"errors\":true") {
+            emit_bad_response_error(response);
             EventStatus::Rejected
         } else {
             EventStatus::Delivered
         }
     } else if status.is_server_error() {
+        emit_bad_response_error(response);
         EventStatus::Errored
     } else {
+        emit_bad_response_error(response);
         EventStatus::Rejected
     }
 }

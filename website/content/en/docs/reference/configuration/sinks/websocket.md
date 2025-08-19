@@ -1,7 +1,7 @@
 ---
-title: Websocket
+title: WebSocket
 description: Deliver observability event data to a websocket listener
-kind: sink
+component_kind: sink
 layout: component
 tags: ["websocket", "component", "sink"]
 ---

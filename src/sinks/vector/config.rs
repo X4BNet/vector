@@ -7,7 +7,7 @@ use tower::ServiceBuilder;
 use vector_lib::configurable::configurable_component;
 
 use super::{
-    service::{VectorResponse, VectorService},
+    service::{VectorRequest, VectorResponse, VectorService},
     sink::VectorSink,
     VectorSinkError,
 };
@@ -74,7 +74,7 @@ pub struct VectorConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub(in crate::sinks::vector) acknowledgements: AcknowledgementsConfig,
 }
@@ -109,7 +109,7 @@ fn default_config(address: &str) -> VectorConfig {
 #[typetag::serde(name = "vector")]
 impl SinkConfig for VectorConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSinkType, Healthcheck)> {
-        let tls = MaybeTlsSettings::from_config(&self.tls, false)?;
+        let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
         let client = new_client(&tls, cx.proxy())?;
@@ -220,6 +220,7 @@ struct VectorGrpcRetryLogic;
 
 impl RetryLogic for VectorGrpcRetryLogic {
     type Error = VectorSinkError;
+    type Request = VectorRequest;
     type Response = VectorResponse;
 
     fn is_retriable_error(&self, err: &Self::Error) -> bool {

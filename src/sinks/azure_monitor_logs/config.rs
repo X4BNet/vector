@@ -80,10 +80,7 @@ pub struct AzureMonitorLogsConfig {
     pub(super) host: String,
 
     #[configurable(derived)]
-    #[serde(
-        default,
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
-    )]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub encoding: Transformer,
 
     #[configurable(derived)]
@@ -112,7 +109,7 @@ pub struct AzureMonitorLogsConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -169,7 +166,7 @@ impl AzureMonitorLogsConfig {
         let shared_key = self.build_shared_key()?;
         let time_generated_key = self.get_time_generated_key();
 
-        let tls_settings = TlsSettings::from_options(&self.tls)?;
+        let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(Some(tls_settings), &cx.proxy)?;
 
         let service = AzureMonitorLogsService::new(

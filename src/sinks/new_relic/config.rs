@@ -5,8 +5,8 @@ use tower::ServiceBuilder;
 use vector_lib::sensitive_string::SensitiveString;
 
 use super::{
-    healthcheck, NewRelicApiResponse, NewRelicApiService, NewRelicEncoder, NewRelicSink,
-    NewRelicSinkError,
+    healthcheck, service::NewRelicApiRequest, NewRelicApiResponse, NewRelicApiService,
+    NewRelicEncoder, NewRelicSink, NewRelicSinkError,
 };
 
 use crate::{http::HttpClient, sinks::prelude::*};
@@ -56,6 +56,7 @@ pub struct NewRelicApiRetry;
 
 impl RetryLogic for NewRelicApiRetry {
     type Error = NewRelicSinkError;
+    type Request = NewRelicApiRequest;
     type Response = NewRelicApiResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
@@ -90,10 +91,7 @@ pub struct NewRelicConfig {
     pub compression: Compression,
 
     #[configurable(derived)]
-    #[serde(
-        default,
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
-    )]
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub encoding: Transformer,
 
     #[configurable(derived)]
@@ -108,7 +106,7 @@ pub struct NewRelicConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
 
@@ -142,7 +140,7 @@ impl SinkConfig for NewRelicConfig {
             .into_batcher_settings()?;
 
         let request_limits = self.request.into_settings();
-        let tls_settings = TlsSettings::from_options(&None)?;
+        let tls_settings = TlsSettings::from_options(None)?;
         let client = HttpClient::new(tls_settings, &cx.proxy)?;
         let credentials = Arc::from(NewRelicCredentials::from(self));
 

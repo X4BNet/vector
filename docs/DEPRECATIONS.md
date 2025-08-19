@@ -1,4 +1,4 @@
-See [DEPRECATION.md](docs/DEPRECATION.md#process) for the process for updating this file.
+See [DEPRECATION.md](/docs/DEPRECATION.md#process) for the process for updating this file.
 
 The format for each entry should be: `<version> <identifier> <description>`.
 
@@ -10,12 +10,12 @@ The format for each entry should be: `<version> <identifier> <description>`.
 
 For example:
 
-- legacy_openssl_provider v0.34.0 OpenSSL legacy provider flag should be removed
+- v0.34.0 legacy_openssl_provider OpenSSL legacy provider flag should be removed
 
 ## To be deprecated
+
+- `v0.49.0` | `block_interpolation` | Interpolating _multi-line_ configuration blocks using environment variables is now deprecated.
 
 ## To be migrated
 
 ## To be removed
-
-- http_internal_metrics v0.35.0 `requests_completed_total`, `request_duration_seconds`, and `requests_received_total` internal metrics should be removed.

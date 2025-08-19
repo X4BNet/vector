@@ -82,13 +82,15 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
                     .with_timezone(&offset)
                     .format(self.filename_time_format.as_str()),
                 None => Utc::now()
-                    .with_timezone(&chrono::Utc)
+                    .with_timezone(&Utc)
                     .format(self.filename_time_format.as_str()),
             };
 
-            self.filename_append_uuid
-                .then(|| format!("{}-{}", formatted_ts, Uuid::new_v4().hyphenated()))
-                .unwrap_or_else(|| formatted_ts.to_string())
+            if self.filename_append_uuid {
+                format!("{formatted_ts}-{}", Uuid::new_v4().hyphenated())
+            } else {
+                formatted_ts.to_string()
+            }
         };
 
         let ssekms_key_id = s3metadata.partition_key.ssekms_key_id.clone();
@@ -101,7 +103,7 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             .cloned()
             .unwrap_or_else(|| self.compression.extension().into());
 
-        s3metadata.s3_key = format!("{}{}.{}", s3metadata.s3_key, filename, extension);
+        s3metadata.s3_key = format_s3_key(&s3metadata.s3_key, &filename, &extension);
 
         S3Request {
             body: payload.into_payload(),
@@ -111,5 +113,27 @@ impl RequestBuilder<(S3PartitionKey, Vec<Event>)> for S3RequestOptions {
             content_encoding: self.compression.content_encoding(),
             options: s3_options,
         }
+    }
+}
+
+fn format_s3_key(s3_key: &str, filename: &str, extension: &str) -> String {
+    if extension.is_empty() {
+        format!("{s3_key}{filename}")
+    } else {
+        format!("{s3_key}{filename}.{extension}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_s3_key() {
+        assert_eq!(
+            "s3_key_filename.txt",
+            format_s3_key("s3_key_", "filename", "txt")
+        );
+        assert_eq!("s3_key_filename", format_s3_key("s3_key_", "filename", ""));
     }
 }

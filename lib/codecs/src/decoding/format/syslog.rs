@@ -24,10 +24,7 @@ pub struct SyslogDeserializerConfig {
     source: Option<&'static str>,
 
     /// Syslog-specific decoding options.
-    #[serde(
-        default,
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
-    )]
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub syslog: SyslogDeserializerOptions,
 }
 
@@ -244,14 +241,14 @@ impl SyslogDeserializerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct SyslogDeserializerOptions {
-    /// Determines whether or not to replace invalid UTF-8 sequences instead of failing.
+    /// Determines whether to replace invalid UTF-8 sequences instead of failing.
     ///
     /// When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
     ///
     /// [U+FFFD]: https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character
     #[serde(
         default = "default_lossy",
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
+        skip_serializing_if = "vector_core::serde::is_default"
     )]
     #[derivative(Default(value = "default_lossy()"))]
     pub lossy: bool,

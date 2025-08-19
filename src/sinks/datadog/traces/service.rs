@@ -23,20 +23,21 @@ pub struct TraceApiRetry;
 
 impl RetryLogic for TraceApiRetry {
     type Error = HttpError;
+    type Request = TraceApiRequest;
     type Response = TraceApiResponse;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
         true
     }
 
-    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction<Self::Request> {
         let status = response.status_code;
         match status {
             // Use the same status code/retry policy as the Trace agent, additionally retrying
             // forbidden requests.
             //
             // This retry logic will be expanded further, but specifically retrying unauthorized
-            // requests for now. I verified using `curl` that `403` is the respose code for this.
+            // requests for now. I verified using `curl` that `403` is the response code for this.
             //
             // https://github.com/vectordotdev/vector/issues/10870
             // https://github.com/vectordotdev/vector/issues/12220
@@ -46,7 +47,7 @@ impl RetryLogic for TraceApiRetry {
                 format!("{}: {}", status, String::from_utf8_lossy(&response.body)).into(),
             ),
             _ if status.is_success() => RetryAction::Successful,
-            _ => RetryAction::DontRetry(format!("response status: {}", status).into()),
+            _ => RetryAction::DontRetry(format!("response status: {status}").into()),
         }
     }
 }

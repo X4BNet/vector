@@ -1,30 +1,25 @@
 #![allow(missing_docs)]
-use std::{num::NonZeroUsize, path::PathBuf, process::ExitStatus, time::Duration};
+use std::{
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+    process::ExitStatus,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use exitcode::ExitCode;
 use futures::StreamExt;
-#[cfg(feature = "enterprise")]
-use futures_util::future::BoxFuture;
-use once_cell::race::OnceNonZeroUsize;
 use tokio::runtime::{self, Runtime};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast::error::RecvError, MutexGuard};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-#[cfg(feature = "enterprise")]
-use crate::config::enterprise::{
-    attach_enterprise_components, report_configuration, EnterpriseError, EnterpriseMetadata,
-    EnterpriseReporter,
-};
-use crate::extra_context::ExtraContext;
-#[cfg(not(feature = "enterprise-tests"))]
-use crate::metrics;
 #[cfg(feature = "api")]
 use crate::{api, internal_events::ApiStarted};
 use crate::{
-    cli::{handle_config_errors, LogFormat, Opts, RootOpts},
-    config::{self, Config, ConfigPath},
+    cli::{handle_config_errors, LogFormat, Opts, RootOpts, WatchConfigMethod},
+    config::{self, ComponentConfig, Config, ConfigPath},
     heartbeat,
-    internal_events::{VectorQuit, VectorStarted, VectorStopped},
+    internal_events::{VectorConfigLoadError, VectorQuit, VectorStarted, VectorStopped},
     signal::{SignalHandler, SignalPair, SignalRx, SignalTo},
     topology::{
         ReloadOutcome, RunningTopology, SharedTopologyController, ShutdownErrorReceiver,
@@ -32,6 +27,7 @@ use crate::{
     },
     trace,
 };
+use crate::{config::ComponentType, extra_context::ExtraContext};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -39,7 +35,11 @@ use std::os::unix::process::ExitStatusExt;
 use std::os::windows::process::ExitStatusExt;
 use tokio::runtime::Handle;
 
-pub static WORKER_THREADS: OnceNonZeroUsize = OnceNonZeroUsize::new();
+static WORKER_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn worker_threads() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(WORKER_THREADS.load(Ordering::Relaxed))
+}
 
 pub struct ApplicationConfig {
     pub config_paths: Vec<config::ConfigPath>,
@@ -48,8 +48,6 @@ pub struct ApplicationConfig {
     pub internal_topologies: Vec<RunningTopology>,
     #[cfg(feature = "api")]
     pub api: config::api::Options,
-    #[cfg(feature = "enterprise")]
-    pub enterprise: Option<EnterpriseReporter<BoxFuture<'static, ()>>>,
     pub extra_context: ExtraContext,
 }
 
@@ -70,9 +68,18 @@ impl ApplicationConfig {
         let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
             .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
 
+        let watcher_conf = if opts.watch_config {
+            Some(watcher_config(
+                opts.watch_config_method,
+                opts.watch_config_poll_interval_seconds,
+            ))
+        } else {
+            None
+        };
+
         let config = load_configs(
             &config_paths,
-            opts.watch_config,
+            watcher_conf,
             opts.require_healthy,
             opts.allow_empty_config,
             graceful_shutdown_duration,
@@ -88,14 +95,6 @@ impl ApplicationConfig {
         config: Config,
         extra_context: ExtraContext,
     ) -> Result<Self, ExitCode> {
-        // This is ugly, but needed to allow `config` to be mutable for building the enterprise
-        // features, but also avoid a "does not need to be mutable" warning when the enterprise
-        // feature is not enabled.
-        #[cfg(feature = "enterprise")]
-        let mut config = config;
-        #[cfg(feature = "enterprise")]
-        let enterprise = build_enterprise(&mut config, config_paths.clone())?;
-
         #[cfg(feature = "api")]
         let api = config.api;
 
@@ -111,8 +110,6 @@ impl ApplicationConfig {
             internal_topologies: Vec::new(),
             #[cfg(feature = "api")]
             api,
-            #[cfg(feature = "enterprise")]
-            enterprise,
             extra_context,
         })
     }
@@ -144,7 +141,8 @@ impl ApplicationConfig {
                 Ok(api_server) => {
                     emit!(ApiStarted {
                         addr: self.api.address.unwrap(),
-                        playground: self.api.playground
+                        playground: self.api.playground,
+                        graphql: self.api.graphql
                     });
 
                     Some(api_server)
@@ -195,7 +193,7 @@ impl Application {
         opts: Opts,
         extra_context: ExtraContext,
     ) -> Result<(Runtime, Self), ExitCode> {
-        init_global(!opts.root.openssl_no_probe);
+        opts.root.init_global();
 
         let color = opts.root.color.use_color();
 
@@ -223,7 +221,7 @@ impl Application {
         let config = runtime.block_on(ApplicationConfig::from_opts(
             &opts.root,
             &mut signals.handler,
-            extra_context.clone(),
+            extra_context,
         ))?;
 
         Ok((
@@ -256,8 +254,6 @@ impl Application {
             topology: config.topology,
             config_paths: config.config_paths.clone(),
             require_healthy: root_opts.require_healthy,
-            #[cfg(feature = "enterprise")]
-            enterprise_reporter: config.enterprise,
             extra_context: config.extra_context,
         });
 
@@ -340,13 +336,30 @@ async fn handle_signal(
     allow_empty_config: bool,
 ) -> Option<SignalTo> {
     match signal {
-        Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
+        Ok(SignalTo::ReloadComponents(components_to_reload)) => {
             let mut topology_controller = topology_controller.lock().await;
-            let new_config = config_builder.build().map_err(handle_config_errors).ok();
-            match topology_controller.reload(new_config).await {
-                ReloadOutcome::FatalError(error) => Some(SignalTo::Shutdown(Some(error))),
-                _ => None,
+            topology_controller
+                .topology
+                .extend_reload_set(components_to_reload);
+
+            // Reload paths
+            if let Some(paths) = config::process_paths(config_paths) {
+                topology_controller.config_paths = paths;
             }
+
+            // Reload config
+            let new_config = config::load_from_paths_with_provider_and_secrets(
+                &topology_controller.config_paths,
+                signal_handler,
+                allow_empty_config,
+            )
+            .await;
+
+            reload_config_from_result(topology_controller, new_config).await
+        }
+        Ok(SignalTo::ReloadFromConfigBuilder(config_builder)) => {
+            let topology_controller = topology_controller.lock().await;
+            reload_config_from_result(topology_controller, config_builder.build()).await
         }
         Ok(SignalTo::ReloadFromDisk) => {
             let mut topology_controller = topology_controller.lock().await;
@@ -362,14 +375,18 @@ async fn handle_signal(
                 signal_handler,
                 allow_empty_config,
             )
-            .await
-            .map_err(handle_config_errors)
-            .ok();
+            .await;
 
-            match topology_controller.reload(new_config).await {
-                ReloadOutcome::FatalError(error) => Some(SignalTo::Shutdown(Some(error))),
-                _ => None,
-            }
+            reload_config_from_result(topology_controller, new_config).await
+        }
+        Ok(SignalTo::ReloadEnrichmentTables) => {
+            let topology_controller = topology_controller.lock().await;
+
+            topology_controller
+                .topology
+                .reload_enrichment_tables()
+                .await;
+            None
         }
         Err(RecvError::Lagged(amt)) => {
             warn!("Overflow, dropped {} signals.", amt);
@@ -377,6 +394,23 @@ async fn handle_signal(
         }
         Err(RecvError::Closed) => Some(SignalTo::Shutdown(None)),
         Ok(signal) => Some(signal),
+    }
+}
+
+async fn reload_config_from_result(
+    mut topology_controller: MutexGuard<'_, TopologyController>,
+    config: Result<Config, Vec<String>>,
+) -> Option<SignalTo> {
+    match config {
+        Ok(new_config) => match topology_controller.reload(new_config).await {
+            ReloadOutcome::FatalError(error) => Some(SignalTo::Shutdown(Some(error))),
+            _ => None,
+        },
+        Err(errors) => {
+            handle_config_errors(errors);
+            emit!(VectorConfigLoadError);
+            None
+        }
     }
 }
 
@@ -445,41 +479,17 @@ impl FinishedApplication {
     }
 }
 
-pub fn init_global(openssl_probe: bool) {
-    if openssl_probe {
-        openssl_probe::init_ssl_cert_env_vars();
-    }
-
-    #[cfg(not(feature = "enterprise-tests"))]
-    metrics::init_global().expect("metrics initialization failed");
-}
-
 fn get_log_levels(default: &str) -> String {
     std::env::var("VECTOR_LOG")
         .or_else(|_| {
-            std::env::var("LOG").map(|log| {
+            std::env::var("LOG").inspect(|_log| {
                 warn!(
                     message =
                         "DEPRECATED: Use of $LOG is deprecated. Please use $VECTOR_LOG instead."
                 );
-                log
             })
         })
-        .unwrap_or_else(|_| match default {
-            "off" => "off".to_owned(),
-            level => [
-                format!("vector={}", level),
-                format!("codec={}", level),
-                format!("vrl={}", level),
-                format!("file_source={}", level),
-                format!("tower_limit={}", level),
-                format!("rdkafka={}", level),
-                format!("buffers={}", level),
-                format!("lapin={}", level),
-                format!("kube={}", level),
-            ]
-            .join(","),
-        })
+        .unwrap_or_else(|_| default.into())
 }
 
 pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtime, ExitCode> {
@@ -488,14 +498,14 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
     rt_builder.enable_all().thread_name(thread_name);
 
     let threads = threads.unwrap_or_else(crate::num_threads);
-    let threads = NonZeroUsize::new(threads).ok_or_else(|| {
+    if threads == 0 {
         error!("The `threads` argument must be greater or equal to 1.");
-        exitcode::CONFIG
-    })?;
+        return Err(exitcode::CONFIG);
+    }
     WORKER_THREADS
-        .set(threads)
-        .expect("double thread initialization");
-    rt_builder.worker_threads(threads.get());
+        .compare_exchange(0, threads, Ordering::Acquire, Ordering::Relaxed)
+        .unwrap_or_else(|_| panic!("double thread initialization"));
+    rt_builder.worker_threads(threads);
 
     debug!(messaged = "Building runtime.", worker_threads = threads);
     Ok(rt_builder.build().expect("Unable to create async runtime"))
@@ -503,7 +513,7 @@ pub fn build_runtime(threads: Option<usize>, thread_name: &str) -> Result<Runtim
 
 pub async fn load_configs(
     config_paths: &[ConfigPath],
-    watch_config: bool,
+    watcher_conf: Option<config::watcher::WatcherConfig>,
     require_healthy: Option<bool>,
     allow_empty_config: bool,
     graceful_shutdown_duration: Option<Duration>,
@@ -511,24 +521,15 @@ pub async fn load_configs(
 ) -> Result<Config, ExitCode> {
     let config_paths = config::process_paths(config_paths).ok_or(exitcode::CONFIG)?;
 
-    if watch_config {
-        // Start listening for config changes immediately.
-        config::watcher::spawn_thread(config_paths.iter().map(Into::into), None).map_err(
-            |error| {
-                error!(message = "Unable to start config watcher.", %error);
-                exitcode::CONFIG
-            },
-        )?;
-    }
+    let watched_paths = config_paths
+        .iter()
+        .map(<&PathBuf>::from)
+        .collect::<Vec<_>>();
 
     info!(
         message = "Loading configs.",
-        paths = ?config_paths.iter().map(<&PathBuf>::from).collect::<Vec<_>>()
+        paths = ?watched_paths
     );
-
-    // config::init_log_schema should be called before initializing sources.
-    #[cfg(not(feature = "enterprise-tests"))]
-    config::init_log_schema(&config_paths, true).map_err(handle_config_errors)?;
 
     let mut config = config::load_from_paths_with_provider_and_secrets(
         &config_paths,
@@ -538,6 +539,63 @@ pub async fn load_configs(
     .await
     .map_err(handle_config_errors)?;
 
+    let mut watched_component_paths = Vec::new();
+
+    if let Some(watcher_conf) = watcher_conf {
+        for (name, transform) in config.transforms() {
+            let files = transform.inner.files_to_watch();
+            let component_config = ComponentConfig::new(
+                files.into_iter().cloned().collect(),
+                name.clone(),
+                ComponentType::Transform,
+            );
+            watched_component_paths.push(component_config);
+        }
+
+        for (name, sink) in config.sinks() {
+            let files = sink.inner.files_to_watch();
+            let component_config = ComponentConfig::new(
+                files.into_iter().cloned().collect(),
+                name.clone(),
+                ComponentType::Sink,
+            );
+            watched_component_paths.push(component_config);
+        }
+
+        for (name, table) in config.enrichment_tables() {
+            let files = table.inner.files_to_watch();
+            let component_config = ComponentConfig::new(
+                files.into_iter().cloned().collect(),
+                name.clone(),
+                ComponentType::EnrichmentTable,
+            );
+            watched_component_paths.push(component_config);
+        }
+
+        info!(
+            message = "Starting watcher.",
+            paths = ?watched_paths
+        );
+        info!(
+            message = "Components to watch.",
+            paths = ?watched_component_paths
+        );
+
+        // Start listening for config changes.
+        config::watcher::spawn_thread(
+            watcher_conf,
+            signal_handler.clone_tx(),
+            watched_paths,
+            watched_component_paths,
+            None,
+        )
+        .map_err(|error| {
+            error!(message = "Unable to start config watcher.", %error);
+            exitcode::CONFIG
+        })?;
+    }
+
+    config::init_log_schema(config.global.log_schema.clone(), true);
     config::init_telemetry(config.global.telemetry.clone(), true);
 
     if !config.healthchecks.enabled {
@@ -547,41 +605,6 @@ pub async fn load_configs(
     config.graceful_shutdown_duration = graceful_shutdown_duration;
 
     Ok(config)
-}
-
-#[cfg(feature = "enterprise")]
-// Enable enterprise features, if applicable.
-fn build_enterprise(
-    config: &mut Config,
-    config_paths: Vec<ConfigPath>,
-) -> Result<Option<EnterpriseReporter<BoxFuture<'static, ()>>>, ExitCode> {
-    use crate::ENTERPRISE_ENABLED;
-
-    ENTERPRISE_ENABLED
-        .set(
-            config
-                .enterprise
-                .as_ref()
-                .map(|e| e.enabled)
-                .unwrap_or_default(),
-        )
-        .expect("double initialization of enterprise enabled flag");
-
-    match EnterpriseMetadata::try_from(&*config) {
-        Ok(metadata) => {
-            let enterprise = EnterpriseReporter::new();
-
-            attach_enterprise_components(config, &metadata);
-            enterprise.send(report_configuration(config_paths, metadata));
-
-            Ok(Some(enterprise))
-        }
-        Err(EnterpriseError::MissingApiKey) => {
-            error!("Enterprise configuration incomplete: missing API key.");
-            Err(exitcode::CONFIG)
-        }
-        Err(_) => Ok(None),
-    }
 }
 
 pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) {
@@ -597,4 +620,14 @@ pub fn init_logging(color: bool, format: LogFormat, log_level: &str, rate: u64) 
         internal_log_rate_secs = rate,
     );
     info!(message = "Log level is enabled.", level = ?level);
+}
+
+pub fn watcher_config(
+    method: WatchConfigMethod,
+    interval: NonZeroU64,
+) -> config::watcher::WatcherConfig {
+    match method {
+        WatchConfigMethod::Recommended => config::watcher::WatcherConfig::RecommendedWatcher,
+        WatchConfigMethod::Poll => config::watcher::WatcherConfig::PollWatcher(interval.into()),
+    }
 }

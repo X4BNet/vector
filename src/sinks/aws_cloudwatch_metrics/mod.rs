@@ -3,12 +3,11 @@ mod integration_tests;
 #[cfg(test)]
 mod tests;
 
-use aws_sdk_cloudwatch::{
-    error::PutMetricDataError,
-    model::{Dimension, MetricDatum},
-    types::SdkError,
-    Client as CloudwatchClient, Region,
-};
+use aws_config::Region;
+use aws_sdk_cloudwatch::error::SdkError;
+use aws_sdk_cloudwatch::operation::put_metric_data::PutMetricDataError;
+use aws_sdk_cloudwatch::types::{Dimension, MetricDatum};
+use aws_sdk_cloudwatch::Client as CloudwatchClient;
 use aws_smithy_types::DateTime as AwsDateTime;
 use futures::{stream, FutureExt, SinkExt};
 use futures_util::{future, future::BoxFuture};
@@ -108,7 +107,7 @@ pub struct CloudWatchMetricsSinkConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     acknowledgements: AcknowledgementsConfig,
 }
@@ -118,16 +117,10 @@ impl_generate_config_from_default!(CloudWatchMetricsSinkConfig);
 struct CloudwatchMetricsClientBuilder;
 
 impl ClientBuilder for CloudwatchMetricsClientBuilder {
-    type Config = aws_sdk_cloudwatch::config::Config;
     type Client = aws_sdk_cloudwatch::client::Client;
-    type DefaultMiddleware = aws_sdk_cloudwatch::middleware::DefaultMiddleware;
 
-    fn default_middleware() -> Self::DefaultMiddleware {
-        aws_sdk_cloudwatch::middleware::DefaultMiddleware::new()
-    }
-
-    fn build(client: aws_smithy_client::Client, config: &aws_types::SdkConfig) -> Self::Client {
-        aws_sdk_cloudwatch::client::Client::with_config(client, config.into())
+    fn build(&self, config: &aws_types::SdkConfig) -> Self::Client {
+        aws_sdk_cloudwatch::client::Client::new(config)
     }
 }
 
@@ -179,12 +172,13 @@ impl CloudWatchMetricsSinkConfig {
         };
 
         create_client::<CloudwatchMetricsClientBuilder>(
+            &CloudwatchMetricsClientBuilder {},
             &self.auth,
             region,
             self.region.endpoint(),
             proxy,
-            &self.tls,
-            true,
+            self.tls.as_ref(),
+            None,
         )
         .await
     }
@@ -207,6 +201,7 @@ struct CloudWatchMetricsRetryLogic;
 
 impl RetryLogic for CloudWatchMetricsRetryLogic {
     type Error = SdkError<PutMetricDataError>;
+    type Request = PartitionInnerBuffer<Vec<Metric>, String>;
     type Response = ();
 
     fn is_retriable_error(&self, error: &Self::Error) -> bool {
@@ -250,7 +245,6 @@ impl CloudWatchMetricsSvc {
                     normalizer.normalize(event.into_metric()).map(|mut metric| {
                         let namespace = metric
                             .take_namespace()
-                            .take()
                             .unwrap_or_else(|| default_namespace.clone());
                         Ok(EncodedEvent::new(
                             PartitionInnerBuffer::new(metric, namespace),

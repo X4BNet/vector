@@ -14,10 +14,7 @@ use vector_core::config::LogNamespace;
 #[derive(Debug, Clone, Default)]
 pub struct NativeJsonDeserializerConfig {
     /// Vector's native JSON-specific decoding options.
-    #[serde(
-        default,
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
-    )]
+    #[serde(default, skip_serializing_if = "vector_core::serde::is_default")]
     pub native_json: NativeJsonDeserializerOptions,
 }
 
@@ -38,7 +35,7 @@ impl NativeJsonDeserializerConfig {
 
     /// Return the type of event build by this deserializer.
     pub fn output_type(&self) -> DataType {
-        DataType::all()
+        DataType::all_bits()
     }
 
     /// The schema produced by the deserializer.
@@ -60,14 +57,14 @@ impl NativeJsonDeserializerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct NativeJsonDeserializerOptions {
-    /// Determines whether or not to replace invalid UTF-8 sequences instead of failing.
+    /// Determines whether to replace invalid UTF-8 sequences instead of failing.
     ///
     /// When true, invalid UTF-8 sequences are replaced with the [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
     ///
     /// [U+FFFD]: https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character
     #[serde(
         default = "default_lossy",
-        skip_serializing_if = "vector_core::serde::skip_serializing_if_default"
+        skip_serializing_if = "vector_core::serde::is_default"
     )]
     #[derivative(Default(value = "default_lossy()"))]
     pub lossy: bool,
@@ -100,7 +97,7 @@ impl Deserializer for NativeJsonDeserializer {
             true => serde_json::from_str(&String::from_utf8_lossy(&bytes)),
             false => serde_json::from_slice(&bytes),
         }
-        .map_err(|error| format!("Error parsing JSON: {:?}", error))?;
+        .map_err(|error| format!("Error parsing JSON: {error:?}"))?;
 
         let events = match json {
             serde_json::Value::Array(values) => values
