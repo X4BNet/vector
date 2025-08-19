@@ -286,10 +286,19 @@ impl Deserializer for SyslogDeserializer {
 
         let log = match (self.source, log_namespace) {
             (Some(source), LogNamespace::Vector) => {
-                let mut log = LogEvent::from(Value::Bytes(Bytes::from(parsed.msg.to_string())));
+                // if line contains "access_log:"
+                let idx = line.find("access_log: ");
+                let mut log;
+                if idx.is_some() {
+                    // find "access_log:" in the bytes and create a new LogEvent
+                    let bytes = bytes.slice(idx.unwrap_or(0) + 11..);
+                    log = LogEvent::from(Value::Bytes(bytes));
+                } else {
+                    log = LogEvent::from(Value::Bytes(Bytes::from(parsed.msg.to_string())));
+                }
                 insert_metadata_fields_from_syslog(&mut log, source, parsed, log_namespace);
                 log
-            }
+                }
             _ => {
                 let mut log = LogEvent::from(Value::Object(ObjectMap::new()));
                 insert_fields_from_syslog(&mut log, parsed, log_namespace);
