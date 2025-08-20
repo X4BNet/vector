@@ -14,6 +14,8 @@ use vector_core::{
 };
 use vrl::value::{kind::Collection, Kind};
 
+use crate::Error;
+
 use super::{default_lossy, Deserializer};
 
 /// Config used to build a `SyslogDeserializer`.
@@ -290,6 +292,7 @@ impl Deserializer for SyslogDeserializer {
                     // find "access_log:" in the bytes and create a new LogEvent
                     let bytes = bytes.slice(idx.unwrap_or(0) + 11..);
                     log = LogEvent::from(Value::Bytes(bytes));
+                    warn!(message = "Hacky syslog.");
                 } else {
                     log = LogEvent::from(Value::Bytes(Bytes::from(parsed.msg.to_string())));
                 }
