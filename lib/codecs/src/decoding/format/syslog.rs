@@ -13,8 +13,7 @@ use vector_core::{
     schema,
 };
 use vrl::value::{kind::Collection, Kind};
-
-use crate::Error;
+use tracing::warn;
 
 use super::{default_lossy, Deserializer};
 
